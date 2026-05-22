@@ -1,0 +1,254 @@
+---
+title: "Scutigera kinematics across developmental instars"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Scutigera kinematics across developmental instars}
+  %\VignetteEngine{knitr::rmarkdown}
+  \usepackage[utf8]{inputenc}
+---
+
+```{r setup, include = FALSE}
+
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 5
+)
+
+
+devtools::load_all(".")
+#library(scutigeraKinDev)
+
+library(ggplot2)
+library(ggrepel)
+library(data.table)
+library(trajr)
+
+```
+
+## Overview
+
+This vignette demonstrates how to go from raw Tracker `.trk` files of
+*Scutigera* locomotion to summary statistics and visualisations of
+kinematic development across instars using the `scutigeraKinDev`
+package. The pipeline mirrors an initial ad-hoc analysis script that
+parsed XML, built trajectories with `{trajr}`, computed body and leg
+kinematics, and generated diagnostic plots. 
+
+We will:
+
+1. Discover and parse `.trk` files.  
+2. Build per-trial trajectories and body-level summaries.  
+3. Visualise speed, body length, and kinetic energy across instars.  
+4. TODO: Optionally, quantify leg protraction/retraction timing and “snow angel” plots in the body frame. 
+
+Replace `path_to_trk_dir` with your actual directory when running this locally.
+
+## 1. Discover and parse `.trk` files
+
+```{r discover}
+
+trk_dir  <- "~/Dropbox/Scutigera/data-2026-05-18/"
+
+trk_files <- discover_trk_files(trk_dir)
+
+length(trk_files)
+head(trk_files)
+
+```
+
+`parse_trk_meta()` extracts global metadata (frame rate, scaling, units, etc.) if needed. [file:1]
+
+```{r meta}
+
+meta <- parse_trk_meta(trk_files)
+head(meta)
+
+```
+
+Next, we turn each `.trk` file into a structured trial object with trajectories for all point masses.
+
+```{r process-trials, message=FALSE}
+
+trials <- lapply(trk_files, process_trk_file)
+
+length(trials)
+
+```
+
+Each element of `trials` is a list with `meta` and `coords`, where `coords[["a"]]` and `coords[["p"]]` are the head and tail markers used for body-level metrics. 
+
+## 2. Body-level kinematics across instars
+
+We first compute body length and center-of-body speed summaries for each trial.
+
+```{r body-stats}
+
+stats <- summarise_body(trials)
+head(stats)
+
+```
+
+Add a few derived quantities (relative speed, kinetic energy) matching the original script. [file:1]
+
+```{r body-derived}
+
+stats[, speed_relative_mean := speed_mean / body_length_mean]
+
+stats[, mass_kg   := mass * 1e-6]       # mg → kg
+stats[, speed_mps := speed_median * 1e-3]  # mm/s → m/s
+stats[, Ekin_nJ   := mass_kg * speed_mps^2 / 2 * 1e9]  # J → nJ
+
+stats2 <- stats[!is.na(body_length_mean) & !is.na(mass)]
+head(stats2)
+
+```
+
+### Mean speed by instar
+
+```{r plot-speed-mean}
+
+ggplot(stats, aes(x = gsub("instar_", "", instar), colour = id)) +
+  geom_pointrange(
+    aes(
+      y    = speed_mean,
+      ymin = speed_mean - speed_sd,
+      ymax = speed_mean + speed_sd
+    ),
+    position = position_dodge(width = 0.2)
+  ) +
+  ggrepel::geom_text_repel(aes(y = speed_mean, label = id)) +
+  xlab("Instar") +
+  ylab("Mean speed (mm/s)") +
+  theme_bw()
+
+  
+```
+
+### Median speed and kinetic energy across instars
+
+```{r plot-speed-median}
+  
+ggplot(stats, aes(x = instar)) +
+  geom_jitter(
+    aes(
+      y    = speed_median,
+      size = mass
+    ),
+    colour = "black",
+    width  = 0.05
+  ) +
+  ggrepel::geom_text_repel(aes(y = speed_median, label = id),
+                           size = 3, colour = "gray50") +
+  xlab("Instar") +
+  ylab("Median speed (mm/s)") +
+  labs(size = "Mass (mg)") +
+  guides(colour = "none") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+```
+
+```{r plot-ekin}
+  
+ggplot(stats, aes(x = instar)) +
+  geom_jitter(
+    aes(
+      y    = Ekin_nJ,
+      size = mass
+    ),
+    colour = "black",
+    width  = 0.05
+  ) +
+  ggrepel::geom_text_repel(aes(y = Ekin_nJ, label = id),
+                           size = 3, colour = "gray50") +
+  xlab("Instar") +
+  ylab("Kinetic energy (nJ)") +
+  scale_y_log10() +
+  labs(
+    size  = "Mass (mg)",
+    title = "Kinetic energy in the horizontal plane"
+  ) +
+  guides(colour = "none") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+```
+
+### Body length and mass vs instar
+
+```{r plot-body-length}
+
+ggplot(stats, aes(x = instar, y = body_length_mean, colour = id)) +
+  geom_jitter(width = 0.2) +
+  xlab("Instar") +
+  ylab("Head–tail length (mm)") +
+  theme_bw()
+  
+```
+
+```{r plot-mass}
+  
+ggplot(stats, aes(x = instar, y = mass, colour = id)) +
+  geom_jitter(width = 0.2) +
+  ggrepel::geom_text_repel(aes(label = id)) +
+  xlab("Instar") +
+  ylab("Mass (mg)") +
+  theme_bw()
+
+```
+
+### Body length vs mass (allometric fit)
+
+```{r plot-body-mass-fit}
+
+fit <- nls(
+  body_length_mean ~ b * (mass)^p,
+  data  = stats2,
+  start = list(b = 1, p = 0.5)
+  )
+
+  pred_df <- data.frame(
+  mass = seq(min(stats2$mass), max(stats2$mass), length.out = 100)
+  )
+  pred_df$fit <- predict(fit, newdata = pred_df)
+
+  cf <- coef(fit)
+  fit_txt <- sprintf("Fitted: b = %.2f, p = %.2f", cf[["b"]], cf[["p"]])
+
+  ggplot() +
+  geom_point(
+    data = stats2,
+    mapping = aes(x = mass, y = body_length_mean)
+  ) +
+  ggrepel::geom_text_repel(
+    data = stats2,
+    mapping = aes(
+      x = mass,
+      y = body_length_mean,
+      label = id,
+      alpha = 0.5
+    ),
+    size = 3
+  ) +
+  geom_line(
+    data = pred_df,
+    mapping = aes(x = mass, y = fit)
+  ) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    title    = "Nonlinear fit: body length ~ b * mass^p",
+    subtitle = fit_txt,
+    x        = "Mass (mg)",
+    y        = "Head–tail length (mm)"
+  ) +
+  guides(alpha = "none") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+  
+```
+
+## 3. Leg kinematics and body-frame “snow angel” plots
+
